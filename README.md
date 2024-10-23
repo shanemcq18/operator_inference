@@ -9,26 +9,8 @@
 
 # Operator Inference in Python
 
-<table style="width:100%; border:none;">
-  <tr>
-    <td style="text-align:center; border:none;">
-      <a href="https://Willcox-Research-Group.github.io/rom-operator-inference-Python3/" style="background-color:#BF5700; border:none; color:white; padding:2px 0; text-align:center; text-decoration:none; display:inline-block; font-size:18px; border-radius:6px; width:200px;">
-        Documentation
-      </a>
-    </td>
-    <td style="text-align:center; border:none;">
-      <a href="https://willcox-research-group.github.io/rom-operator-inference-Python3/source/opinf/literature.html" style="background-color:#333f48; border:none; color:white; padding:2px 0; text-align:center; text-decoration:none; display:inline-block; font-size:18px; border-radius:6px; width:200px;">
-        Literature
-      </a>
-    </td>
-    <td style="text-align:center; border:none;">
-      <a href="https://doi.org/10.1016/j.cma.2016.03.025" style="background-color:#005F86; border:none; color:white; padding:2px 0; text-align:center; text-decoration:none; display:inline-block; font-size:18px; border-radius:6px; width:200px;">
-        Original Paper
-      </a>
-    </td>
-  </tr>
-</table>
-
 This package is a Python implementation of the Operator Inference framework for learning projection-based polynomial reduced-order models of dynamical systems.
 The procedure is **data-driven** and **non-intrusive**, making it a viable candidate for model reduction of "glass-box" systems.
 The methodology was [introduced in 2016 by Peherstorfer and Willcox](https://www.sciencedirect.com/science/article/pii/S0045782516301104).
+
+[**See the Documentation Here**](https://willcox-research-group.github.io/rom-operator-inference-Python3/).
