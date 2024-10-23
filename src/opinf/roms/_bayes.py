@@ -118,7 +118,7 @@ class OperatorPosterior:
     @property
     def randomvariables(self) -> list:
         """Multivariate normal random variables for the rows of the operator
-        matrix (see :class:`scipy.stats.multivariate_normal`).
+        matrix.
         """
         return self.__randomvariables
 
@@ -225,6 +225,7 @@ class _BayesianROMMixin:
         return self.__posterior
 
     def _initialize_posterior(self):
+        """Set the operator posterior if numerically possible."""
         means, precisions = self.model.solver.posterior()
         try:
             self.__posterior = OperatorPosterior(means, precisions)
@@ -232,8 +233,10 @@ class _BayesianROMMixin:
             if ex.args[0] == "Matrix is not positive definite":
                 self.__posterior = None
 
-    def _draw_operators(self):
-        """Set the model operators to a draw from the operator posterior."""
+    def draw_operators(self):
+        """Set the :attr:`model` operators to a new random draw from the
+        :attr:`posterior` operator distribution.
+        """
         self.model._extract_operators(self.posterior.rvs())
 
     def fit_regselect_continuous(
@@ -351,7 +354,7 @@ class _BayesianROMMixin:
             # Pass stability checks.
             for tcase in processed_test_cases:
                 for _ in range(num_posterior_draws):
-                    self._draw_operators()
+                    self.draw_operators()
                     if not tcase.evaluate(self.model, **predict_options):
                         return np.inf
 
@@ -367,7 +370,7 @@ class _BayesianROMMixin:
                 draws = []
                 trainsize = Q.shape[-1]
                 for _ in range(num_posterior_draws):
-                    self._draw_operators()
+                    self.draw_operators()
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         solution = self.model.predict(
@@ -488,7 +491,7 @@ class _BayesianROMMixin:
             # Pass stability checks.
             for tcase in processed_test_cases:
                 for _ in range(num_posterior_draws):
-                    self._draw_operators()
+                    self.draw_operators()
                     if not tcase.evaluate(self.model):
                         return np.inf
 
@@ -503,7 +506,7 @@ class _BayesianROMMixin:
                     predict_args = (Q[:, 0], niter, U)
                 draws = []
                 for _ in range(num_posterior_draws):
-                    self._draw_operators()
+                    self.draw_operators()
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         solution = self.model.predict(*predict_args)
@@ -526,7 +529,66 @@ class _BayesianROMMixin:
 
 
 class BayesianROM(ROM, _BayesianROMMixin):
-    """Probabilistic nonparametric reduced-order model."""
+    r"""Probabilistic nonparametric reduced-order model.
+
+    This class connects classes from the various submodules to form a complete
+    reduced-order modeling workflow for probabilistic models.
+
+    High-dimensional data
+    :math:`\to` transformed / preprocessed data
+    :math:`\to` compressed data
+    :math:`\to` low-dimensional probabilistic model.
+
+    Operator inference models are uniquely determined by operator matrices
+    :math:`\Ohat\in\RR^{r\times d}` that concatenate the entries of all
+    operators in the model. For example, the time-continuous model
+
+    .. math::
+       \ddt\qhat(t) = \chat + \Ahat\qhat(t) + \Hhat[\qhat(t)\otimes\qhat(t)]
+
+    is uniquely determined by the operator matrix
+
+    .. math::
+       \Ohat = [~\chat~~\Ahat~~\Hhat~] \in \RR^{r \times d}.
+
+    Typical *deterministic* operator inference learns a single operator matrix
+    :math:`\Ohat` from state measurements, while *probabilistic* or *Bayesian*
+    operator inference constructs a distribution of operator matrices,
+    :math:`p(\Ohat)`. This class solves a Bayesian linear inference to define
+    an :class:`OperatorPosterior` and facilitates sampling from the posterior.
+    See :cite:`guo2022bayesopinf`.
+
+    Parameters
+    ----------
+    model : :mod:`opinf.models` object
+        Nonparametric system model, an instance of one of the following:
+
+        * :class:`opinf.models.ContinuousModel`
+        * :class:`opinf.models.DiscreteModel`
+
+        The model must have a ``solver`` of one of the following types:
+
+        * :class:`opinf.lstsq.L2Solver`
+        * :class:`opinf.lstsq.L2DecoupledSolver`
+        * :class:`opinf.lstsq.TikhonovSolver`
+        * :class:`opinf.lstsq.TikhonovDecoupledSolver`
+
+    lifter : :mod:`opinf.lift` object or None
+        Lifting transformation.
+    transformer : :mod:`opinf.pre` object or None
+        Preprocesser.
+    basis : :mod:`opinf.basis` object or None
+        Dimensionality reducer.
+    ddt_estimator : :mod:`opinf.ddt` object or None
+        Time derivative estimator.
+        Ignored if ``model`` is not time continuous.
+
+    Notes
+    -----
+    The ``operators`` attribute of the :attr:`model` represents a single draw
+    from the operator distribution and is modified every time
+    :meth:`draw_operators` or :meth:`predict` are called.
+    """
 
     def __init__(
         self,
@@ -583,6 +645,87 @@ class BayesianROM(ROM, _BayesianROMMixin):
         verbose: bool = False,
         **predict_options: dict,
     ):
+        """Calibrate the time-continuous model to training data, selecting the
+        regularization hyperparameter(s) that minimize the sample mean training
+        error while maintaining stability over the testing regime.
+
+        This method requires the :attr:`model` to be time-continuous; use
+        :meth:`fit_regselect_discrete` for discrete models. The
+        ``model.solver.regularizer`` is repeatedly adjusted, and the operator
+        :attr:`posterior` is recalibrated, until a best regularization is
+        selected. Training error is measured by comparing training data to the
+        sample mean of ``num_posterior_draws`` model predictions. Stability is
+        required for each of the individual model predictions.
+        See :cite:`mcquarrie2021combustion,guo2022bayesopinf`.
+
+        Parameters
+        ----------
+        candidates : list of regularization hyperparameters
+            Regularization hyperparameters to check before carrying out a
+            derivative-free optimization.
+        train_time_domains : list of s (k_i,) ndarrays
+            Time domain corresponding to the training states.
+        states : list of s (n, k_i) ndarrays
+            State snapshots in the original state space. Each array
+            ``states[i]`` is data corresponding to a different trajectory;
+            each column ``states[i][:, j]`` is one snapshot.
+        ddts : list of s (n, k_i) ndarrays or None
+            Snapshot time derivative data. Each array ``ddts[i]`` are the time
+            derivatives of ``states[i]``; each column ``ddts[i][:, j]``
+            corresponds to the snapshot ``states[i][:, j]``. If ``None``
+            (default), these are estimated using :attr:`ddt_estimator`.
+        input_functions : list of s callables or None
+            Input functions mapping time to input vectors. Only required if the
+            :attr:`model` takes external inputs. Each ``input_functions[i]``
+            is the function corresponding to ``states[i]``, and
+            ``input_functions[i](train_time_domains[i][j])`` is the input
+            vector corresponding to the snapshot ``states[i][:, j]``.
+        fit_transformer : bool
+            If ``True`` (default), calibrate the preprocessing transformation
+            using the ``states``.
+            If ``False``, assume the transformer is already calibrated.
+        fit_basis : bool
+            If ``True`` (default), calibrate the high-to-low dimensional
+            mapping using the ``states``.
+            If ``False``, assume the basis is already calibrated.
+        regularizer_factory : callable or None
+            Function mapping regularization hyperparameters to the full
+            regularizer. Specifically, ``regularizer_factory(candidates[i])``
+            will be assigned to ``model.solver.regularizer`` for each ``i``.
+            If ``None`` (default), set ``regularizer_factory()`` to the
+            identity function.
+        gridsearch_only : bool
+            If ``True``, stop after checking all regularization ``candidates``
+            and do not follow up with optimization.
+        test_time_length : float or None
+            Amount of time after the training regime in which to require model
+            stability.
+        stability_margin : float
+            Factor by which the predicted reduced states may deviate from the
+            range of the training reduced states without the trajectory being
+            classified as unstable.
+        num_posterior_draws : int
+            Number of draws from the operator :attr:`posterior` for stability
+            checks and for estimating the sample mean of model predictions.
+        test_cases : list of ContinuousRegTest objects
+            Additional test cases for which the model is required to be stable.
+            See :class:`opinf.utils.ContinuousRegTest`.
+        verbose : bool
+            If ``True``, print information during the regularization selection.
+        predict_options : dict or None
+            Extra arguments for :meth:`opinf.models.ContinuousModel.predict`.
+
+        Notes
+        -----
+        If there is only one trajectory of training data (s = 1), ``states``
+        may be provided as an (n, k) ndarray. In this case, it is assumed that
+        ``ddts`` (if provided) is an (n, k) ndarray.
+
+        The ``train_time_domains`` may be a single one-dimensional array, in
+        which case it is assumed that each trajectory ``states[i]`` corresponds
+        to the same time domain. Similarly, if ``input_functions`` is a single
+        callable, it is assumed to be the input function for each trajectory.
+        """
         return _BayesianROMMixin.fit_regselect_continuous(
             self,
             candidates=candidates,
@@ -618,6 +761,66 @@ class BayesianROM(ROM, _BayesianROMMixin):
         test_cases: list = None,
         verbose: bool = False,
     ):
+        """Calibrate the fully discrete model to training data, selecting the
+        regularization hyperparameter(s) that minimize the sample mean training
+        error while maintaining stability over the testing regime.
+
+        This method requires the :attr:`model` to be fully discrete; use
+        :meth:`fit_regselect_continuous` for time-continuous models. The
+        ``model.solver.regularizer`` is repeatedly adjusted, and the operator
+        :attr:`posterior` is recalibrated, until a best regularization is
+        selected. Training error is measured by comparing training data to the
+        sample mean of ``num_posterior_draws`` model predictions. Stability is
+        required for each of the individual model predictions.
+        See :cite:`mcquarrie2021combustion,guo2022bayesopinf`.
+
+        Parameters
+        ----------
+        candidates : list of regularization hyperparameters
+            Regularization hyperparameters to check. If a single hyperparameter
+            is given, use it as the start of an optimization-based search.
+        states : list of s (n, k_i) ndarrays
+            State snapshots in the original state space. Each array
+            ``states[i]`` is data corresponding to a different trajectory;
+            each column ``states[i][:, j]`` is one snapshot. This method
+            assumes the snapshots are sequential, i.e., the model maps
+            ``states[i][:, j]`` to ``states[i][:, j+1]``.
+        states : list of s (r, k_i) ndarrays
+            State snapshots in the reduced state space. This method assumes
+            the snapshots are sequential, i.e., the model maps
+            ``states[i][:, j]`` to ``states[i][:, j+1]``.
+        inputs : list of s (m, k_i + num_test_iters) ndarrays
+            Inputs corresponding to the training data, together with inputs
+            for the testing regime. Only required if the :attr:`model` takes
+            external inputs.
+        regularizer_factory : callable or None
+            Function mapping regularization hyperparameters to the full
+            regularizer. Specifically, ``regularizer_factory(candidates[i])``
+            will be assigned to ``model.solver.regularizer`` for each ``i``.
+        gridsearch_only : bool
+            If ``True``, stop after checking all regularization ``candidates``
+            and do not follow up with optimization.
+        num_test_iters : int
+            Number of iterations after the training data in which to require
+            model stability.
+        stability_margin : float,
+            Factor by which the reduced states may deviate from the range of
+            the training data without being flagged as unstable.
+        num_posterior_draws : int
+            Number of draws from the operator :attr:`posterior` for stability
+            checks and for estimating the sample mean of model predictions.
+        test_cases : list of DiscreteRegTest objects
+            Additional test cases for which the model is required to be stable.
+            See :class:`opinf.utils.DiscreteRegTest`.
+        verbose : bool
+            If ``True``, print information during the regularization selection.
+
+        Notes
+        -----
+        If there is only one trajectory of training data (s = 1), ``states``
+        may be provided as an (n, k) ndarray. In this case, it is assumed that
+        ``inputs`` (if provided) is a single (m, k + num_test_iters) ndarray.
+        """
         return _BayesianROMMixin.fit_regselect_discrete(
             self,
             candidates=candidates,
@@ -636,12 +839,92 @@ class BayesianROM(ROM, _BayesianROMMixin):
         )
 
     def predict(self, state0, *args, **kwargs):
-        self._draw_operators()
+        """Draw from the operator posterior and evaluate the resulting model.
+
+        Arguments are the same as the ``predict()`` method of :attr:`model`.
+
+        Parameters
+        ----------
+        state0 : (n,) ndarray
+            Initial state, expressed in the original state space.
+        *args : list
+            Other positional arguments to the ``predict()`` method of
+            :attr:`model`.
+        **kwargs : dict
+            Keyword arguments to the ``predict()`` method of :attr:`model`.
+
+        Returns
+        -------
+        states: (n, k) ndarray
+            Solution to the drawn model, expressed in the original state space.
+        """
+        self.draw_operators()
         return ROM.predict(self, state0, *args, **kwargs)
 
 
 class BayesianParametricROM(ParametricROM, _BayesianROMMixin):
-    """Probabilistic parametric reduced-order model."""
+    r"""Probabilistic parametric reduced-order model.
+
+    This class connects classes from the various submodules to form a complete
+    reduced-order modeling workflow for probabilistic, parametric models.
+
+    High-dimensional state data
+    :math:`\to` transformed / preprocessed data
+    :math:`\to` compressed data
+    :math:`\to` low-dimensional probabilistic model.
+
+    Operator inference models are uniquely determined by operator matrices
+    :math:`\Ohat\in\RR^{r\times d}` that concatenate the entries of all
+    operators in the model. For example, the time-continuous parametric model
+
+    .. math::
+       \ddt\qhat(t;\bfmu) = \mu_1\Ahat\qhat(t) + \mu_2\Bhat\u(t)
+
+    is uniquely determined by the operator matrix
+
+    .. math::
+       \Ohat = [~\Ahat~~\Nhat~] \in \RR^{r \times d}.
+
+    Typical *deterministic* operator inference learns a single operator matrix
+    :math:`\Ohat` from state measurements, while *probabilistic* or *Bayesian*
+    operator inference constructs a distribution of operator matrices,
+    :math:`p(\Ohat)`. This class solves a Bayesian linear inference to define
+    an :class:`OperatorPosterior` and facilitates sampling from the posterior.
+    See :cite:`guo2022bayesopinf`.
+
+    Parameters
+    ----------
+    model : :mod:`opinf.models` object
+        Parametric system model, an instance of one of the following:
+
+        * :class:`opinf.models.ParametricContinuousModel`
+        * :class:`opinf.models.ParametricDiscreteModel`
+        * :class:`opinf.models.InterpContinuousModel`
+        * :class:`opinf.models.InterpDiscreteModel`
+
+        The model must have a ``solver`` of one of the following types:
+
+        * :class:`opinf.lstsq.L2Solver`
+        * :class:`opinf.lstsq.L2DecoupledSolver`
+        * :class:`opinf.lstsq.TikhonovSolver`
+        * :class:`opinf.lstsq.TikhonovDecoupledSolver`
+
+    lifter : :mod:`opinf.lift` object or None
+        Lifting transformation.
+    transformer : :mod:`opinf.pre` object or None
+        Preprocesser.
+    basis : :mod:`opinf.basis` object or None
+        Dimensionality reducer.
+    ddt_estimator : :mod:`opinf.ddt` object or None
+        Time derivative estimator.
+        Ignored if ``model`` is not time continuous.
+
+    Notes
+    -----
+    The ``operators`` attribute of the :attr:`model` represents a single draw
+    from the operator distribution and is modified every time
+    :meth:`draw_operators` or :meth:`predict` are called.
+    """
 
     def __init__(
         self,
@@ -701,6 +984,90 @@ class BayesianParametricROM(ParametricROM, _BayesianROMMixin):
         verbose: bool = False,
         **predict_options: dict,
     ):
+        """Calibrate the time-continuous model to training data, selecting the
+        regularization hyperparameter(s) that minimize the sample mean training
+        error while maintaining stability over the testing regime.
+
+        This method requires the :attr:`model` to be time-continuous; use
+        :meth:`fit_regselect_discrete` for fully discrete models. The
+        ``model.solver.regularizer`` is repeatedly adjusted, and the operator
+        :attr:`posterior` is recalibrated, until a best regularization is
+        selected. Training error is measured by comparing training data to the
+        sample mean of ``num_posterior_draws`` model predictions. Stability is
+        required for each of the individual model predictions.
+        See :cite:`mcquarrie2021combustion,mcquarrie2023parametric`.
+
+        Parameters
+        ----------
+        candidates : list of regularization hyperparameters
+            Regularization hyperparameters to check before carrying out a
+            derivative-free optimization.
+        train_time_domains : list of s (k_i,) ndarrays
+            Time domain corresponding to the training states.
+        parameters : list of s (floats or (p,) ndarrays)
+            Parameter values for which training data are available.
+        states : list of s (n, k_i) ndarrays
+            State snapshots in the original state space. Each array
+            ``states[i]`` is the data corresponding to parameter value
+            ``parameters[i]``; each column ``states[i][:, j]`` is one snapshot.
+        ddts : list of s (n, k_i) ndarrays or None
+            Snapshot time derivative data. Each array ``ddts[i]`` are the time
+            derivatives of ``states[i]``; each column ``ddts[i][:, j]``
+            corresponds to the snapshot ``states[i][:, j]``. If ``None``
+            (default), these are estimated using :attr:`ddt_estimator`.
+        input_functions : list of s callables or None
+            Input functions mapping time to input vectors. Only required if the
+            :attr:`model` takes external inputs. Each ``input_functions[i]``
+            is the function corresponding to ``states[i]``, and
+            ``input_functions[i](train_time_domains[i][j])`` is the input
+            vector corresponding to the snapshot ``states[i][:, j]``.
+        fit_transformer : bool
+            If ``True`` (default), calibrate the preprocessing transformation
+            using the ``states``.
+            If ``False``, assume the transformer is already calibrated.
+        fit_basis : bool
+            If ``True`` (default), calibrate the high-to-low dimensional
+            mapping using the ``states``.
+            If ``False``, assume the basis is already calibrated.
+        regularizer_factory : callable or None
+            Function mapping regularization hyperparameters to the full
+            regularizer. Specifically, ``regularizer_factory(candidates[i])``
+            will be assigned to ``model.solver.regularizer`` for each ``i``.
+            If ``None`` (default), set ``regularizer_factory()`` to the
+            identity function.
+        gridsearch_only : bool
+            If ``True``, stop after checking all regularization ``candidates``
+            and do not follow up with optimization.
+        test_time_length : float or None
+            Amount of time after the training regime in which to require model
+            stability.
+        stability_margin : float
+            Factor by which the predicted reduced states may deviate from the
+            range of the training reduced states without the trajectory being
+            classified as unstable.
+        num_posterior_draws : int
+            Number of draws from the operator :attr:`posterior` for stability
+            checks and for estimating the sample mean of model predictions.
+        test_cases : list of ContinuousRegTest objects
+            Additional test cases for which the model is required to be stable.
+            See :class:`opinf.utils.ContinuousRegTest`.
+        verbose : bool
+            If ``True``, print information during the regularization selection.
+        predict_options : dict or None
+            Extra arguments for :meth:`opinf.models.ContinuousModel.predict`,
+            for example, ``method="BDF"``.
+
+        Returns
+        -------
+        self
+
+        Notes
+        -----
+        The ``train_time_domains`` may be a single one-dimensional array, in
+        which case it is assumed that each trajectory ``states[i]`` corresponds
+        to the same time domain. Similarly, if ``input_functions`` is a single
+        callable, it is assumed to be the input function for each trajectory.
+        """
         return _BayesianROMMixin.fit_regselect_continuous(
             self,
             candidates=candidates,
@@ -737,6 +1104,66 @@ class BayesianParametricROM(ParametricROM, _BayesianROMMixin):
         test_cases: list = None,
         verbose: bool = False,
     ):
+        """Calibrate the fully discrete model to training data, selecting the
+        regularization hyperparameter(s) that minimize the sample mean training
+        error while maintaining stability over the testing regime.
+
+        This method requires the :attr:`model` to be fully discrete; use
+        :meth:`fit_regselect_continuous` for time-continuous models. The
+        ``model.solver.regularizer`` is repeatedly adjusted, and the operator
+        :attr:`posterior` is recalibrated, until a best regularization is
+        selected. Training error is measured by comparing training data to the
+        sample mean of ``num_posterior_draws`` model predictions. Stability is
+        required for each of the individual model predictions.
+        See :cite:`mcquarrie2021combustion,mcquarrie2023parametric`.
+
+        Parameters
+        ----------
+        candidates : list of regularization hyperparameters
+            Regularization hyperparameters to check. If a single hyperparameter
+            is given, use it as the start of an optimization-based search.
+        parameters : list of s (floats or (p,) ndarrays)
+            Parameter values for which training data are available.
+        states : list of s (n, k_i) ndarrays
+            State snapshots in the original state space. Each array
+            ``states[i]`` is the data corresponding to parameter value
+            ``parameters[i]``; each column ``states[i][:, j]`` is one snapshot.
+            This method assumes the snapshots are sequential, i.e., the model
+            maps ``states[i][:, j]`` to ``states[i][:, j+1]``.
+        inputs : list of s (m, k_i + num_test_iters) ndarrays
+            Inputs corresponding to the training data, together with inputs
+            for the testing regime. Only required if the :attr:`model` takes
+            external inputs.
+        fit_transformer : bool
+            If ``True`` (default), calibrate the preprocessing transformation
+            using the ``states``.
+            If ``False``, assume the transformer is already calibrated.
+        fit_basis : bool
+            If ``True`` (default), calibrate the high-to-low dimensional
+            mapping using the ``states``.
+            If ``False``, assume the basis is already calibrated.
+        regularizer_factory : callable or None
+            Function mapping regularization hyperparameters to the full
+            regularizer. Specifically, ``regularizer_factory(candidates[i])``
+            will be assigned to ``model.solver.regularizer`` for each ``i``.
+        gridsearch_only : bool
+            If ``True``, stop after checking all regularization ``candidates``
+            and do not follow up with optimization.
+        num_test_iters : int
+            Number of iterations after the training data in which to require
+            model stability.
+        stability_margin : float,
+            Factor by which the reduced states may deviate from the range of
+            the training data without being flagged as unstable.
+        num_posterior_draws : int
+            Number of draws from the operator :attr:`posterior` for stability
+            checks and for estimating the sample mean of model predictions.
+        test_cases : list of DiscreteRegTest objects
+            Additional test cases for which the model is required to be stable.
+            See :class:`opinf.utils.DiscreteRegTest`.
+        verbose : bool
+            If ``True``, print information during the regularization selection.
+        """
         return _BayesianROMMixin.fit_regselect_discrete(
             self,
             candidates=candidates,
@@ -755,5 +1182,26 @@ class BayesianParametricROM(ParametricROM, _BayesianROMMixin):
         )
 
     def predict(self, parameter, state0, *args, **kwargs):
-        self._draw_operators()
+        r"""Draw from the operator posterior and evaluate the resulting model.
+
+        Arguments are the same as the ``predict()`` method of :attr:`model`.
+
+        Parameters
+        ----------
+        parameter : (p,) ndarray
+            Parameter value :math:`\bfmu`.
+        state0 : (n,) ndarray
+            Initial state, expressed in the original state space.
+        *args : list
+            Other positional arguments to the ``predict()`` method of
+            :attr:`model`.
+        **kwargs : dict
+            Keyword arguments to the ``predict()`` method of :attr:`model`.
+
+        Returns
+        -------
+        states: (n, k) ndarray
+            Solution to the drawn model, expressed in the original state space.
+        """
+        self.draw_operators()
         return ParametricROM.predict(self, parameter, state0, *args, **kwargs)
